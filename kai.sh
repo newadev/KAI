@@ -189,6 +189,23 @@ install_packages() {
 	esac
 }
 
+ensure_dirs() {
+	mkdir -p "${INSTALL_DIR}" "${INSTALL_DIR}/bin" "${LOG_DIR}" "${RUN_DIR}"
+}
+
+running_on_systemd() {
+	if [[ -d /run/systemd/system ]]; then
+		return 0
+	fi
+	local pid1
+	pid1=$(ps -p 1 -o comm= 2>/dev/null || true)
+	[[ ${pid1} == systemd ]]
+}
+
+running_on_alpine() {
+	[[ -f /etc/alpine-release ]]
+}
+
 enable_crond_on_alpine() {
 	if running_on_alpine; then
 		log_info "Ensuring crond is enabled on Alpine"
