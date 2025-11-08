@@ -38,7 +38,7 @@ DEFAULT_CONFIG_TEMPLATE='{
 	"show_warning": false,
 	"custom_ipv4": "",
 	"custom_ipv6": "",
-	"get_ip_addr_from_nic": true
+	"get_ip_addr_from_nic": false
 }'
 
 AMD64_URL="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-amd64"
@@ -78,6 +78,7 @@ AUTO_MODE=""   # empty, number (minutes) or 'd'
 DEBUG_MODE=0
 UNINSTALL_ONLY=0
 SHOW_LOGS=0
+CFG_SOURCE_TYPE=""
 
 usage() {
 	cat <<EOF
@@ -248,6 +249,47 @@ validate_url() {
 	return 0
 }
 
+is_filesystem_path() {
+	local value=$1
+	[[ ${value} == /* || ${value} == .* || ${value} == ../* || ${value} == */* || ${value} == ~/* ]]
+}
+
+is_plain_filename() {
+	local value=$1
+	[[ ${value} != */* && ${value} != .* && ${value} != ../* && ${value} != ~/* ]]
+}
+
+trim_string() {
+	local raw=$1
+	local trimmed
+	trimmed="${raw#${raw%%[![:space:]]*}}"
+	trimmed="${trimmed%${trimmed##*[![:space:]]}}"
+	printf '%s' "${trimmed}"
+}
+
+normalize_endpoint() {
+	local raw=$1
+	if [[ -z ${raw} ]]; then
+		printf '%s\n' ""
+		return
+	fi
+	# Trim surrounding whitespace using parameter expansion
+	local trimmed
+	trimmed="${raw#"${raw%%[![:space:]]*}"}"
+	trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+	if [[ -z ${trimmed} ]]; then
+		printf '%s\n' ""
+		return
+	fi
+	local lower=${trimmed,,}
+	if [[ ${lower} =~ ^https?:// ]]; then
+		printf '%s\n' "${trimmed}"
+	else
+		trimmed=${trimmed#//}
+		printf 'https://%s\n' "${trimmed}"
+	fi
+}
+
 validate_json_file() {
 	local file=$1
 	if command -v jq >/dev/null 2>&1; then
@@ -299,6 +341,73 @@ data[key] = value
 with open(path, 'w', encoding='utf-8') as fh:
 		json.dump(data, fh, ensure_ascii=False, indent=2)
 PY
+	fi
+}
+
+read_json_value() {
+	local file=$1
+	local key=$2
+	if command -v jq >/dev/null 2>&1; then
+		jq -r --arg key "${key}" '.[$key] // ""' "${file}"
+	else
+		python3 - "$file" "$key" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+
+try:
+	with open(path, 'r', encoding='utf-8') as fh:
+		data = json.load(fh)
+except Exception:
+	print("")
+	sys.exit(0)
+
+value = data.get(key, "")
+if isinstance(value, str):
+	print(value)
+else:
+	print("")
+PY
+	fi
+}
+
+validate_local_config_requirements() {
+	local file=$1
+	local endpoint auto token
+	endpoint=$(read_json_value "${file}" "endpoint")
+	auto=$(read_json_value "${file}" "auto_discovery_key")
+	token=$(read_json_value "${file}" "token")
+
+	endpoint=$(trim_string "${endpoint}")
+	auto=$(trim_string "${auto}")
+	token=$(trim_string "${token}")
+
+	if [[ -z ${endpoint} ]]; then
+		die "Config provided via -c must include endpoint with http(s):// prefix"
+	fi
+	if [[ ! ${endpoint} =~ ^https?:// ]]; then
+		die "Config provided via -c contains invalid endpoint (expected http(s)://...)"
+	fi
+
+	local has_valid=0
+	if [[ -n ${auto} ]]; then
+		if validate_alnum "${auto}"; then
+			has_valid=1
+		else
+			die "Config auto_discovery_key must be alphanumeric"
+		fi
+	fi
+	if [[ -n ${token} ]]; then
+		if validate_alnum "${token}"; then
+			has_valid=1
+		else
+			die "Config token must be alphanumeric"
+		fi
+	fi
+	if (( has_valid == 0 )); then
+		die "Config must provide a valid auto_discovery_key or token"
 	fi
 }
 
@@ -717,12 +826,42 @@ VALID_COMBO=0
 
 if [[ -n ${CFG_SOURCE} ]]; then
 	VALID_COMBO=1
-	if [[ -f ${CFG_SOURCE} ]]; then
-		CFG_URL_FOR_AUTO=""
-	else
+	original_source=${CFG_SOURCE}
+	if [[ ${CFG_SOURCE} =~ ^https?:// ]]; then
 		validate_url "${CFG_SOURCE}" || die "-c URL is not reachable"
 		CFG_URL_FOR_AUTO="${CFG_SOURCE}"
+		CFG_SOURCE_TYPE="remote"
+	elif [[ -f ${CFG_SOURCE} ]]; then
+		CFG_URL_FOR_AUTO=""
+		CFG_SOURCE_TYPE="local"
+	else
+		if is_filesystem_path "${CFG_SOURCE}"; then
+			die "Config file ${CFG_SOURCE} not found"
+		fi
+		if is_plain_filename "${CFG_SOURCE}"; then
+			https_candidate="https://${CFG_SOURCE}"
+			if validate_url "${https_candidate}"; then
+				CFG_SOURCE="${https_candidate}"
+				CFG_URL_FOR_AUTO="${CFG_SOURCE}"
+				CFG_SOURCE_TYPE="remote"
+			else
+				http_candidate="http://${CFG_SOURCE}"
+				if validate_url "${http_candidate}"; then
+					CFG_SOURCE="${http_candidate}"
+					CFG_URL_FOR_AUTO="${CFG_SOURCE}"
+					CFG_SOURCE_TYPE="remote"
+				else
+					die "-c value ${original_source} not found locally and unreachable via http(s)"
+				fi
+			fi
+		else
+			die "Config file ${CFG_SOURCE} not found"
+		fi
 	fi
+fi
+
+if [[ -n ${OPT_ENDPOINT} ]]; then
+	OPT_ENDPOINT=$(normalize_endpoint "${OPT_ENDPOINT}")
 fi
 
 if [[ -n ${OPT_AUTO_DISCOVERY} || -n ${OPT_TOKEN} ]]; then
@@ -757,6 +896,10 @@ fi
 
 fetch_config_from_source "${CFG_SOURCE}" "${CONFIG_PATH}"
 
+if [[ ${CFG_SOURCE_TYPE} == "local" ]]; then
+	validate_json_file "${CONFIG_PATH}"
+fi
+
 if [[ -n ${OPT_AUTO_DISCOVERY} ]]; then
 	apply_config_override "auto_discovery_key" "${OPT_AUTO_DISCOVERY}" "${CONFIG_PATH}"
 fi
@@ -769,6 +912,10 @@ fi
 
 validate_json_file "${CONFIG_PATH}"
 chmod 600 "${CONFIG_PATH}"
+
+if [[ ${CFG_SOURCE_TYPE} == "local" ]]; then
+	validate_local_config_requirements "${CONFIG_PATH}"
+fi
 
 download_agent_binary
 generate_wrapper_script
