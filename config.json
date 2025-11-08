@@ -22,5 +22,5 @@
   "show_warning": false,
   "custom_ipv4": "",
   "custom_ipv6": "",
-  "get_ip_addr_from_nic": true
+  "get_ip_addr_from_nic": false
 }
