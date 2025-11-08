@@ -259,6 +259,18 @@ is_plain_filename() {
 	[[ ${value} != */* && ${value} != .* && ${value} != ../* && ${value} != ~/* ]]
 }
 
+looks_like_domain_with_path() {
+	local value=$1
+	if [[ ${value} == .* || ${value} == ../* || ${value} == ~/* || ${value} == /* ]]; then
+		return 1
+	fi
+	if [[ ${value} != */* ]]; then
+		return 1
+	fi
+	local prefix=${value%%/*}
+	[[ ${prefix} == *.* ]]
+}
+
 trim_string() {
 	local raw=$1
 	local trimmed
@@ -835,10 +847,25 @@ if [[ -n ${CFG_SOURCE} ]]; then
 		CFG_URL_FOR_AUTO=""
 		CFG_SOURCE_TYPE="local"
 	else
-		if is_filesystem_path "${CFG_SOURCE}"; then
+		if looks_like_domain_with_path "${CFG_SOURCE}"; then
+			https_candidate="https://${CFG_SOURCE}"
+			if validate_url "${https_candidate}"; then
+				CFG_SOURCE="${https_candidate}"
+				CFG_URL_FOR_AUTO="${CFG_SOURCE}"
+				CFG_SOURCE_TYPE="remote"
+			else
+				http_candidate="http://${CFG_SOURCE}"
+				if validate_url "${http_candidate}"; then
+					CFG_SOURCE="${http_candidate}"
+					CFG_URL_FOR_AUTO="${CFG_SOURCE}"
+					CFG_SOURCE_TYPE="remote"
+				else
+					die "-c value ${original_source} not found locally and unreachable via http(s)"
+				fi
+			fi
+		elif is_filesystem_path "${CFG_SOURCE}"; then
 			die "Config file ${CFG_SOURCE} not found"
-		fi
-		if is_plain_filename "${CFG_SOURCE}"; then
+		elif is_plain_filename "${CFG_SOURCE}"; then
 			https_candidate="https://${CFG_SOURCE}"
 			if validate_url "${https_candidate}"; then
 				CFG_SOURCE="${https_candidate}"
