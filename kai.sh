@@ -1,467 +1,390 @@
 #!/usr/bin/env bash
+# kai.sh — Komari Agent Installer (Hardened, dedicated system user)
+# Supports: Ubuntu, Debian, CentOS, AlmaLinux, Rocky, Fedora, Alpine Linux
+# Requires: root (sudo) for setup; agent runs as unprivileged 'komari' user
 
-# Exit immediately on error, treat unset vars as error, and fail on pipeline errors
+# ─── Bootstrap: if running under non-bash shell (e.g. Alpine ash), install bash
+#     and re-exec. This block must be valid POSIX sh.
+if [ -z "$BASH_VERSION" ]; then
+	if command -v bash >/dev/null 2>&1; then
+		exec bash "$0" "$@"
+	fi
+	# No bash available — try to install it
+	if [ -f /etc/alpine-release ] && command -v apk >/dev/null 2>&1; then
+		echo "[INFO] bash not found, installing via apk..."
+		apk add --quiet bash || { echo "[ERROR] Failed to install bash" >&2; exit 1; }
+		exec bash "$0" "$@"
+	fi
+	echo "[ERROR] bash is required but not found. Install bash first." >&2
+	exit 1
+fi
+
 set -euo pipefail
 umask 077
 
-SCRIPT_BASENAME="$(basename "$0")"
-INSTALL_DIR="${HOME}/.local/komari-agent"
-BIN_PATH="${INSTALL_DIR}/bin/komari-agent"
-CONFIG_PATH="${INSTALL_DIR}/config.json"
-LOG_DIR="${INSTALL_DIR}/logs"
-RUN_DIR="${INSTALL_DIR}/run"
-SERVICE_NAME="komari-agent"
-SYSTEMD_UNIT_PATH="${HOME}/.config/systemd/user/${SERVICE_NAME}.service"
-ALPINE_CRON_MARKER="${INSTALL_DIR}/.cron_installed"
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SERVICE_USER="komari"
+readonly SERVICE_GROUP="komari"
+readonly INSTALL_DIR="/opt/komari-agent"
+readonly BIN_PATH="${INSTALL_DIR}/bin/komari-agent"
+readonly CONFIG_PATH="${INSTALL_DIR}/config.json"
+readonly LOG_DIR="${INSTALL_DIR}/logs"
+readonly RUN_DIR="${INSTALL_DIR}/run"
+readonly SERVICE_NAME="komari-agent"
+readonly SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly OPENRC_INIT="/etc/init.d/${SERVICE_NAME}"
+readonly CRON_MARKER="${INSTALL_DIR}/.cron_installed"
 
-DEFAULT_CONFIG_TEMPLATE='{
-	"auto_discovery_key": "",
-	"disable_auto_update": false,
-	"disable_web_ssh": true,
-	"memory_mode_available": false,
-	"token": "",
-	"endpoint": "",
-	"interval": 5,
-	"ignore_unsafe_cert": false,
-	"max_retries": 5,
-	"reconnect_interval": 10,
-	"info_report_interval": 10,
-	"include_nics": "",
-	"exclude_nics": "",
-	"include_mountpoints": "/",
-	"month_rotate": 1,
-	"cf_access_client_id": "",
-	"cf_access_client_secret": "",
-	"memory_include_cache": true,
-	"custom_dns": "1.1.1.1,8.8.8.8,223.5.5.5",
-	"enable_gpu": false,
-	"show_warning": false,
-	"custom_ipv4": "",
-	"custom_ipv6": "",
-	"get_ip_addr_from_nic": false
+readonly AMD64_URL="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-amd64"
+readonly ARM64_URL="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-arm64"
+
+readonly DEFAULT_CONFIG='{
+  "auto_discovery_key": "",
+  "disable_auto_update": false,
+  "disable_web_ssh": true,
+  "token": "",
+  "endpoint": "",
+  "interval": 5,
+  "ignore_unsafe_cert": false,
+  "max_retries": 5,
+  "reconnect_interval": 10,
+  "info_report_interval": 15,
+  "include_nics": "",
+  "exclude_nics": "",
+  "include_mountpoints": "",
+  "month_rotate": 1,
+  "cf_access_client_id": "",
+  "cf_access_client_secret": "",
+  "memory_include_cache": true,
+  "memory_report_raw_used": false,
+  "custom_dns": "1.1.1.1",
+  "enable_gpu": false,
+  "custom_ipv4": "",
+  "custom_ipv6": "",
+  "get_ip_addr_from_nic": false,
+  "host_proc": ""
 }'
 
-AMD64_URL="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-amd64"
-ARM64_URL="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-arm64"
+die()      { echo "[ERROR] $1" >&2; exit 1; }
+log_info() { echo "[INFO] $1"; }
+log_warn() { echo "[WARN] $1"; }
+log_ok()   { echo "[OK] $1"; }
 
-COLOR_INFO="\033[0;36m"
-COLOR_WARN="\033[0;33m"
-COLOR_ERROR="\033[0;31m"
-COLOR_SUCCESS="\033[0;32m"
-COLOR_RESET="\033[0m"
 
-die() {
-	local msg=$1
-	printf "%b[%s]%b %s\n" "${COLOR_ERROR}" "ERROR" "${COLOR_RESET}" "${msg}" >&2
-	exit 1
-}
-
-log_info() {
-	printf "%b[%s]%b %s\n" "${COLOR_INFO}" "INFO" "${COLOR_RESET}" "$1"
-}
-
-log_warn() {
-	printf "%b[%s]%b %s\n" "${COLOR_WARN}" "WARN" "${COLOR_RESET}" "$1"
-}
-
-log_success() {
-	printf "%b[%s]%b %s\n" "${COLOR_SUCCESS}" "OK" "${COLOR_RESET}" "$1"
-}
-
-# Globals populated by argument parsing
 CFG_SOURCE=""
+CFG_SOURCE_TYPE=""
 CFG_URL_FOR_AUTO=""
 OPT_AUTO_DISCOVERY=""
 OPT_TOKEN=""
 OPT_ENDPOINT=""
-AUTO_MODE=""   # empty, number (minutes) or 'd'
+AUTO_MODE=""
 DEBUG_MODE=0
 UNINSTALL_ONLY=0
 SHOW_LOGS=0
-CFG_SOURCE_TYPE=""
 
 usage() {
 	cat <<EOF
-Usage: ${SCRIPT_BASENAME} [options]
+Usage: ${SCRIPT_NAME} [options]
 
 Options:
-	-c <path|url>       Local config file or remote URL for installation.
-	-a <value>          Override auto_discovery_key.
-	-t <value>          Override token.
-	-e <url>            Override endpoint URL http(s).
-	-log                Tail service status and last 50 log lines in real time.
-	--auto [min|d]      Enable auto config updates (default 10 min) or disable with 'd'.
-	--debug             Enable verbose execution trace.
-	-u, --uninstall     Stop services/cron and remove installation directory.
+  -c <path|url>     Config file (local path or remote URL)
+  -a <key>          Set auto_discovery_key (alphanumeric, <=64 chars)
+  -t <token>        Set token (alphanumeric, <=64 chars)
+  -e <url>          Set endpoint URL (http/https, must be reachable)
+  -log              Show service status and tail last 50 log lines
+  --auto [min|d]    Enable auto config sync (default: 10 min); 'd' to disable
+  --debug           Enable verbose trace output
+  -u, --uninstall   Stop service, remove user and all files
+
+Installation requires one of:
+  1. -c <config>
+  2. -a <key> -e <url>
+  3. -t <token> -e <url>
 
 Examples:
-	bash ${SCRIPT_BASENAME} -c ./config.json
-	bash ${SCRIPT_BASENAME} -a KEY -e URL
-	bash ${SCRIPT_BASENAME} -t TOKEN -e URL
-	bash ${SCRIPT_BASENAME} -c http(s)://example.com/config.json --auto 10
-
+  sudo bash ${SCRIPT_NAME} -c ./config.json
+  sudo bash ${SCRIPT_NAME} -a DISCOVERY_KEY -e https://panel.example.com
+  sudo bash ${SCRIPT_NAME} -t TOKEN -e https://panel.example.com
+  sudo bash ${SCRIPT_NAME} -c https://example.com/config.json --auto 10
+  sudo bash ${SCRIPT_NAME} -log
+  sudo bash ${SCRIPT_NAME} -u
 EOF
 }
 
-install_packages() {
-	local commands=("$@")
-	local missing=()
-	for cmd in "${commands[@]}"; do
-		if ! command -v "${cmd}" >/dev/null 2>&1; then
-			missing+=("${cmd}")
-		fi
-	done
-	[[ ${#missing[@]} -eq 0 ]] && return 0
-
-	local pm=""
-	if command -v apt-get >/dev/null 2>&1; then
-		pm="apt-get"
-	elif command -v apt >/dev/null 2>&1; then
-		pm="apt"
-	elif command -v dnf >/dev/null 2>&1; then
-		pm="dnf"
-	elif command -v yum >/dev/null 2>&1; then
-		pm="yum"
-	elif command -v apk >/dev/null 2>&1; then
-		pm="apk"
-	else
-		die "Unsupported package manager. Please install ${missing[*]} manually."
-	fi
-
-	local packages=()
-	for cmd in "${missing[@]}"; do
-		case ${cmd} in
-			crontab)
-				case ${pm} in
-					apt-get|apt)
-						packages+=("cron")
-						;;
-					dnf|yum)
-						packages+=("cronie")
-						;;
-					apk)
-						packages+=("dcron")
-						;;
-					*)
-						packages+=("${cmd}")
-						;;
-				esac
-				;;
-			*)
-				packages+=("${cmd}")
-				;;
-		esac
-	done
-
-	local unique_packages=()
-	declare -A seen=()
-	for pkg in "${packages[@]}"; do
-		if [[ -z ${seen[${pkg}]+x} ]]; then
-			unique_packages+=("${pkg}")
-			seen[${pkg}]=1
-		fi
-	done
-
-	log_info "Installing missing dependencies (${missing[*]}) via ${pm}"
-	case ${pm} in
-		apt-get)
-			sudo apt-get update || die "Failed to update package index using apt-get"
-			sudo apt-get install -y "${unique_packages[@]}" || die "Failed to install packages: ${unique_packages[*]}"
-			;;
-		apt)
-			sudo apt update || die "Failed to update package index using apt"
-			sudo apt install -y "${unique_packages[@]}" || die "Failed to install packages: ${unique_packages[*]}"
-			;;
-		dnf)
-			sudo dnf makecache || die "Failed to update package index using dnf"
-			sudo dnf install -y "${unique_packages[@]}" || die "Failed to install packages: ${unique_packages[*]}"
-			;;
-		yum)
-			sudo yum makecache || die "Failed to update package index using yum"
-			sudo yum install -y "${unique_packages[@]}" || die "Failed to install packages: ${unique_packages[*]}"
-			;;
-		apk)
-			sudo apk update || die "Failed to update package index using apk"
-			sudo apk add "${unique_packages[@]}" || die "Failed to install packages: ${unique_packages[*]}"
-			;;
-		*)
-			die "Unsupported package manager. Please install ${missing[*]} manually."
-			;;
-	esac
+require_root() {
+	[[ ${EUID} -eq 0 ]] || die "This script must be run as root (use sudo)"
 }
 
-ensure_dirs() {
-	mkdir -p "${INSTALL_DIR}" "${INSTALL_DIR}/bin" "${LOG_DIR}" "${RUN_DIR}"
-}
-
-running_on_systemd() {
-	if [[ -d /run/systemd/system ]]; then
-		return 0
-	fi
+is_systemd() {
+	[[ -d /run/systemd/system ]] && return 0
 	local pid1
 	pid1=$(ps -p 1 -o comm= 2>/dev/null || true)
 	[[ ${pid1} == systemd ]]
 }
 
-running_on_alpine() {
-	[[ -f /etc/alpine-release ]]
-}
+is_alpine() { [[ -f /etc/alpine-release ]]; }
 
-enable_crond_on_alpine() {
-	if running_on_alpine; then
-		log_info "Ensuring crond is enabled on Alpine"
-		if ! sudo rc-service crond start; then
-			log_warn "Failed to start crond automatically. Please start it manually."
-		fi
-		if ! sudo rc-update add crond >/dev/null 2>&1; then
-			log_warn "Failed to add crond to rc-update."
-		fi
-	fi
-}
+install_packages() {
+	local cmds=("$@") missing=()
+	for c in "${cmds[@]}"; do
+		command -v "${c}" >/dev/null 2>&1 || missing+=("${c}")
+	done
+	[[ ${#missing[@]} -eq 0 ]] && return 0
 
-ensure_linger() {
-	if running_on_systemd; then
-		if ! command -v loginctl >/dev/null 2>&1; then
-			log_warn "loginctl not found; linger will not be adjusted"
-			return
-		fi
-		if ! sudo loginctl enable-linger "${USER}" >/dev/null 2>&1; then
-			log_warn "loginctl enable-linger failed. User services may not start on boot."
-		else
-			log_success "linger enabled for ${USER}"
-		fi
-	fi
+	local pm=""
+	for try in apt-get apt dnf yum apk; do
+		command -v "${try}" >/dev/null 2>&1 && { pm="${try}"; break; }
+	done
+	[[ -n ${pm} ]] || die "No supported package manager. Install ${missing[*]} manually."
+
+	# Map command → package name
+	local pkgs=()
+	for cmd in "${missing[@]}"; do
+		case ${cmd} in
+			crontab)
+				case ${pm} in
+					apt-get|apt) pkgs+=("cron") ;;
+					dnf|yum)     pkgs+=("cronie") ;;
+					apk)         pkgs+=("dcron") ;;
+				esac ;;
+			*) pkgs+=("${cmd}") ;;
+		esac
+	done
+
+	# Deduplicate
+	local unique=()
+	declare -A _seen=()
+	for p in "${pkgs[@]}"; do
+		[[ -z ${_seen[${p}]+x} ]] && { unique+=("${p}"); _seen[${p}]=1; }
+	done
+
+	log_info "Installing: ${unique[*]} (via ${pm})"
+	case ${pm} in
+		apt-get) apt-get update -qq && apt-get install -y -qq "${unique[@]}" ;;
+		apt)     apt update -qq && apt install -y -qq "${unique[@]}" ;;
+		dnf)     dnf install -y -q "${unique[@]}" ;;
+		yum)     yum install -y -q "${unique[@]}" ;;
+		apk)     apk add --quiet "${unique[@]}" ;;
+	esac || die "Failed to install: ${unique[*]}"
 }
 
 validate_alnum() {
-	local value=$1
-	[[ ${#value} -le 64 && ${value} =~ ^[0-9A-Za-z]+$ ]]
+	local v=$1
+	[[ ${#v} -le 64 && ${v} =~ ^[0-9A-Za-z]+$ ]]
 }
 
 validate_url() {
 	local url=$1
-	if [[ ! ${url} =~ ^https?:// ]]; then
-		return 1
-	fi
-	if ! curl -Is --max-time 10 "${url}" >/dev/null; then
-		return 1
-	fi
-	return 0
-}
-
-is_filesystem_path() {
-	local value=$1
-	[[ ${value} == /* || ${value} == .* || ${value} == ../* || ${value} == */* || ${value} == ~/* ]]
-}
-
-is_plain_filename() {
-	local value=$1
-	[[ ${value} != */* && ${value} != .* && ${value} != ../* && ${value} != ~/* ]]
-}
-
-looks_like_domain_with_path() {
-	local value=$1
-	if [[ ${value} == .* || ${value} == ../* || ${value} == ~/* || ${value} == /* ]]; then
-		return 1
-	fi
-	if [[ ${value} != */* ]]; then
-		return 1
-	fi
-	local prefix=${value%%/*}
-	[[ ${prefix} == *.* ]]
-}
-
-trim_string() {
-	local raw=$1
-	local trimmed
-	trimmed="${raw#${raw%%[![:space:]]*}}"
-	trimmed="${trimmed%${trimmed##*[![:space:]]}}"
-	printf '%s' "${trimmed}"
+	[[ ${url} =~ ^https?:// ]] || return 1
+	curl -fsS --max-time 10 -o /dev/null "${url}" 2>/dev/null
 }
 
 normalize_endpoint() {
 	local raw=$1
-	if [[ -z ${raw} ]]; then
-		printf '%s\n' ""
-		return
-	fi
-	# Trim surrounding whitespace using parameter expansion
-	local trimmed
-	trimmed="${raw#"${raw%%[![:space:]]*}"}"
-	trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
-	if [[ -z ${trimmed} ]]; then
-		printf '%s\n' ""
-		return
-	fi
-	local lower=${trimmed,,}
-	if [[ ${lower} =~ ^https?:// ]]; then
-		printf '%s\n' "${trimmed}"
+	raw="${raw#"${raw%%[![:space:]]*}"}"
+	raw="${raw%"${raw##*[![:space:]]}"}"
+	[[ -z ${raw} ]] && return
+	if [[ ${raw,,} =~ ^https?:// ]]; then
+		printf '%s' "${raw}"
 	else
-		trimmed=${trimmed#//}
-		printf 'https://%s\n' "${trimmed}"
+		raw="${raw#//}"
+		printf 'https://%s' "${raw}"
 	fi
 }
 
 validate_json_file() {
-	local file=$1
+	local f=$1
 	if command -v jq >/dev/null 2>&1; then
-		if ! jq empty "${file}" >/dev/null 2>&1; then
-			die "Config ${file} is not valid JSON"
-		fi
+		jq empty "${f}" 2>/dev/null || die "Invalid JSON: ${f}"
 	elif command -v python3 >/dev/null 2>&1; then
-		if ! python3 -m json.tool "${file}" >/dev/null 2>&1; then
-			die "Config ${file} is not valid JSON"
-		fi
+		python3 -m json.tool "${f}" >/dev/null 2>&1 || die "Invalid JSON: ${f}"
 	else
-		log_warn "Skipping JSON validation; jq and python3 not available"
+		log_warn "Cannot validate JSON (no jq or python3)"
 	fi
 }
 
-fetch_config_from_source() {
-	local source=$1
-	local dest=$2
-	if [[ -z ${source} ]]; then
-		printf '%s\n' "${DEFAULT_CONFIG_TEMPLATE}" >"${dest}"
+json_read() {
+	local file=$1 key=$2
+	if command -v jq >/dev/null 2>&1; then
+		jq -r --arg k "${key}" '.[$k] // ""' "${file}"
+	else
+		python3 -c "
+import json,sys
+with open('${file}') as f: d=json.load(f)
+v=d.get('${key}','')
+print(v if isinstance(v,str) else '')" 2>/dev/null || echo ""
+	fi
+}
+
+json_set() {
+	local file=$1 key=$2 value=$3
+	if command -v jq >/dev/null 2>&1; then
+		local tmp; tmp=$(mktemp)
+		jq --arg v "${value}" ".${key} = \$v" "${file}" >"${tmp}" && mv "${tmp}" "${file}"
+	else
+		python3 -c "
+import json
+with open('${file}') as f: d=json.load(f)
+d['${key}']='${value}'
+with open('${file}','w') as f: json.dump(d,f,ensure_ascii=False,indent=2)
+"
+	fi
+}
+
+looks_like_domain_path() {
+	local v=$1
+	[[ ${v} == .* || ${v} == ../* || ${v} == ~/* || ${v} == /* ]] && return 1
+	[[ ${v} != */* ]] && return 1
+	local prefix=${v%%/*}
+	[[ ${prefix} == *.* ]]
+}
+
+resolve_cfg_source() {
+	local src=$1
+	[[ -z ${src} ]] && return
+
+	if [[ ${src} =~ ^https?:// ]]; then
+		validate_url "${src}" || die "-c URL unreachable: ${src}"
+		CFG_URL_FOR_AUTO="${src}"
+		CFG_SOURCE_TYPE="remote"
 		return
 	fi
 
-	if [[ -f ${source} ]]; then
-		cp "${source}" "${dest}"
+	if [[ -f ${src} ]]; then
+		CFG_SOURCE_TYPE="local"
+		return
+	fi
+
+	# Try as bare domain/path
+	if looks_like_domain_path "${src}" || [[ ${src} != */* && ${src} != .* ]]; then
+		for proto in https http; do
+			local candidate="${proto}://${src}"
+			if validate_url "${candidate}"; then
+				CFG_SOURCE="${candidate}"
+				CFG_URL_FOR_AUTO="${candidate}"
+				CFG_SOURCE_TYPE="remote"
+				return
+			fi
+		done
+	fi
+
+	die "-c value not found locally and unreachable via http(s): ${src}"
+}
+
+fetch_config() {
+	local src=$1 dest=$2
+	if [[ -z ${src} ]]; then
+		printf '%s\n' "${DEFAULT_CONFIG}" >"${dest}"
+	elif [[ -f ${src} ]]; then
+		cp "${src}" "${dest}"
 	else
-		curl -fsSL "${source}" -o "${dest}" || die "Failed to download config from ${source}"
+		curl -fsSL "${src}" -o "${dest}" || die "Failed to download config: ${src}"
 	fi
 }
 
-apply_config_override() {
-	local key=$1
-	local value=$2
-	local file=$3
-
-	if command -v jq >/dev/null 2>&1; then
-		local tmp_file
-		tmp_file=$(mktemp)
-		jq --arg v "${value}" ".${key} = \$v" "${file}" >"${tmp_file}" && mv "${tmp_file}" "${file}"
-	else
-		python3 - <<PY
-import json,sys
-path = "${file}"
-key = "${key}"
-value = "${value}"
-with open(path, 'r', encoding='utf-8') as fh:
-		data = json.load(fh)
-data[key] = value
-with open(path, 'w', encoding='utf-8') as fh:
-		json.dump(data, fh, ensure_ascii=False, indent=2)
-PY
-	fi
-}
-
-read_json_value() {
+validate_config_credentials() {
 	local file=$1
-	local key=$2
-	if command -v jq >/dev/null 2>&1; then
-		jq -r --arg key "${key}" '.[$key] // ""' "${file}"
-	else
-		python3 - "$file" "$key" <<'PY'
-import json
-import sys
+	local endpoint auto_key token
+	endpoint=$(json_read "${file}" "endpoint")
+	auto_key=$(json_read "${file}" "auto_discovery_key")
+	token=$(json_read "${file}" "token")
 
-path = sys.argv[1]
-key = sys.argv[2]
+	# Trim whitespace
+	endpoint="${endpoint#"${endpoint%%[![:space:]]*}"}"
+	auto_key="${auto_key#"${auto_key%%[![:space:]]*}"}"
+	token="${token#"${token%%[![:space:]]*}"}"
 
-try:
-	with open(path, 'r', encoding='utf-8') as fh:
-		data = json.load(fh)
-except Exception:
-	print("")
-	sys.exit(0)
+	[[ -n ${endpoint} ]] || die "Config must contain endpoint (http(s)://...)"
+	[[ ${endpoint} =~ ^https?:// ]] || die "Config endpoint invalid (need http(s)://...)"
 
-value = data.get(key, "")
-if isinstance(value, str):
-	print(value)
-else:
-	print("")
-PY
-	fi
-}
-
-validate_local_config_requirements() {
-	local file=$1
-	local endpoint auto token
-	endpoint=$(read_json_value "${file}" "endpoint")
-	auto=$(read_json_value "${file}" "auto_discovery_key")
-	token=$(read_json_value "${file}" "token")
-
-	endpoint=$(trim_string "${endpoint}")
-	auto=$(trim_string "${auto}")
-	token=$(trim_string "${token}")
-
-	if [[ -z ${endpoint} ]]; then
-		die "Config provided via -c must include endpoint with http(s):// prefix"
-	fi
-	if [[ ! ${endpoint} =~ ^https?:// ]]; then
-		die "Config provided via -c contains invalid endpoint (expected http(s)://...)"
-	fi
-
-	local has_valid=0
-	if [[ -n ${auto} ]]; then
-		if validate_alnum "${auto}"; then
-			has_valid=1
-		else
-			die "Config auto_discovery_key must be alphanumeric"
-		fi
+	local ok=0
+	if [[ -n ${auto_key} ]]; then
+		validate_alnum "${auto_key}" || die "Config auto_discovery_key must be alphanumeric <=64"
+		ok=1
 	fi
 	if [[ -n ${token} ]]; then
-		if validate_alnum "${token}"; then
-			has_valid=1
-		else
-			die "Config token must be alphanumeric"
-		fi
+		validate_alnum "${token}" || die "Config token must be alphanumeric <=64"
+		ok=1
 	fi
-	if (( has_valid == 0 )); then
-		die "Config must provide a valid auto_discovery_key or token"
+	(( ok )) || die "Config must provide a valid auto_discovery_key or token"
+}
+
+create_service_user() {
+	if id "${SERVICE_USER}" &>/dev/null; then
+		log_info "User '${SERVICE_USER}' already exists"
+		return
 	fi
+	log_info "Creating system user: ${SERVICE_USER}"
+	if command -v useradd >/dev/null 2>&1; then
+		useradd --system --no-create-home --home-dir "${INSTALL_DIR}" \
+			--shell /usr/sbin/nologin "${SERVICE_USER}"
+	elif command -v adduser >/dev/null 2>&1; then
+		# Alpine
+		addgroup -S "${SERVICE_GROUP}" 2>/dev/null || true
+		adduser -S -D -H -h "${INSTALL_DIR}" -s /sbin/nologin \
+			-G "${SERVICE_GROUP}" "${SERVICE_USER}"
+	else
+		die "Cannot create system user (no useradd or adduser)"
+	fi
+	log_ok "User '${SERVICE_USER}' created (nologin)"
+}
+
+remove_service_user() {
+	id "${SERVICE_USER}" &>/dev/null || return 0
+	log_info "Removing user: ${SERVICE_USER}"
+	if command -v userdel >/dev/null 2>&1; then
+		userdel "${SERVICE_USER}" 2>/dev/null || true
+	elif command -v deluser >/dev/null 2>&1; then
+		deluser "${SERVICE_USER}" 2>/dev/null || true
+	fi
+	if getent group "${SERVICE_GROUP}" &>/dev/null; then
+		groupdel "${SERVICE_GROUP}" 2>/dev/null || true
+	fi
+}
+
+ensure_dirs() {
+	mkdir -p "${INSTALL_DIR}/bin" "${LOG_DIR}" "${RUN_DIR}"
+	# logs/ and base dir: service user writable (logs, config auto-sync)
+	chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}"
+	chmod 750 "${INSTALL_DIR}" "${INSTALL_DIR}/bin" "${LOG_DIR}" "${RUN_DIR}"
+	# bin/ and run/: root-owned, service user read+exec only (defense-in-depth)
+	chown root:"${SERVICE_GROUP}" "${INSTALL_DIR}/bin" "${RUN_DIR}"
 }
 
 current_arch_url() {
-	local arch
-	arch=$(uname -m)
-	case "${arch}" in
-		x86_64|amd64)
-			printf '%s' "${AMD64_URL}"
-			;;
-		aarch64|arm64)
-			printf '%s' "${ARM64_URL}"
-			;;
-		*)
-			die "Unsupported architecture: ${arch}"
-			;;
+	case "$(uname -m)" in
+		x86_64|amd64)  printf '%s' "${AMD64_URL}" ;;
+		aarch64|arm64) printf '%s' "${ARM64_URL}" ;;
+		*) die "Unsupported architecture: $(uname -m)" ;;
 	esac
 }
 
-download_agent_binary() {
-	local url
+download_binary() {
+	local url tmp magic
 	url=$(current_arch_url)
-	log_info "Downloading komari-agent binary from ${url}"
-	mkdir -p "$(dirname "${BIN_PATH}")"
-	curl -fsSL "${url}" -o "${BIN_PATH}" || die "Failed to download komari-agent binary"
-	chmod +x "${BIN_PATH}"
-	log_success "Binary placed at ${BIN_PATH}"
+	tmp="${BIN_PATH}.tmp"
+	log_info "Downloading komari-agent from ${url}"
+	rm -f "${tmp}"
+	curl -fsSL "${url}" -o "${tmp}" || { rm -f "${tmp}"; die "Download failed"; }
+	magic=$(dd if="${tmp}" bs=4 count=1 2>/dev/null | od -An -t x1 | tr -d ' \n')
+	[[ ${magic} == "7f454c46" ]] || { rm -f "${tmp}"; die "Not a valid ELF binary (download corrupted?)"; }
+	chmod 750 "${tmp}"
+	chown root:"${SERVICE_GROUP}" "${tmp}"
+	mv "${tmp}" "${BIN_PATH}"
+	log_ok "Binary: ${BIN_PATH}"
 }
 
-generate_wrapper_script() {
-	cat >"${RUN_DIR}/komari-wrapper.sh" <<'EOF'
+generate_wrapper() {
+	cat >"${RUN_DIR}/komari-wrapper.sh" <<'WRAPPER'
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_DIR="${HOME}/.local/komari-agent"
+INSTALL_DIR="/opt/komari-agent"
 BIN_PATH="${INSTALL_DIR}/bin/komari-agent"
 CONFIG_PATH="${INSTALL_DIR}/config.json"
 LOG_DIR="${INSTALL_DIR}/logs"
 RUN_DIR="${INSTALL_DIR}/run"
 AUTO_CONF="${RUN_DIR}/auto-update.conf"
-UPDATE_SCRIPT="${RUN_DIR}/update-config.sh"
-UPDATED_FLAG="${RUN_DIR}/.config_updated"
 AGENT_LOG="${LOG_DIR}/komari-agent.log"
 
 mkdir -p "${LOG_DIR}"
@@ -469,523 +392,402 @@ mkdir -p "${LOG_DIR}"
 agent_pid=0
 
 cleanup() {
-	if [[ ${agent_pid:-0} -ne 0 ]]; then
+	if (( agent_pid > 0 )); then
 		kill "${agent_pid}" 2>/dev/null || true
 		wait "${agent_pid}" 2>/dev/null || true
 		agent_pid=0
 	fi
 }
-
 trap 'cleanup; exit 0' INT TERM
 trap cleanup EXIT
 
 read_auto_conf() {
-	AUTO_ENABLED=0
-	AUTO_INTERVAL=10
-	AUTO_URL=""
-	if [[ -f ${AUTO_CONF} ]]; then
-		# shellcheck disable=SC1090
-		source "${AUTO_CONF}"
-	fi
-	if [[ -z ${AUTO_INTERVAL} || ! ${AUTO_INTERVAL} =~ ^[0-9]+$ ]]; then
-		AUTO_INTERVAL=10
-	elif (( AUTO_INTERVAL <= 0 )); then
-		AUTO_INTERVAL=10
-	fi
+	AUTO_ENABLED=0; AUTO_INTERVAL=10; AUTO_URL=""
+	[[ -f ${AUTO_CONF} ]] && source "${AUTO_CONF}"
+	[[ ${AUTO_INTERVAL} =~ ^[0-9]+$ && ${AUTO_INTERVAL} -gt 0 ]] || AUTO_INTERVAL=10
 }
 
-ensure_update_script() {
-	cat >"${UPDATE_SCRIPT}" <<'US'
-#!/usr/bin/env bash
-set -euo pipefail
-
-RUN_DIR="${HOME}/.local/komari-agent/run"
-AUTO_CONF="${RUN_DIR}/auto-update.conf"
-CONFIG_PATH="${HOME}/.local/komari-agent/config.json"
-UPDATED_FLAG="${RUN_DIR}/.config_updated"
-TMP_FILE="$(mktemp)"
-
-AUTO_ENABLED=0
-AUTO_INTERVAL=10
-AUTO_URL=""
-if [[ -f ${AUTO_CONF} ]]; then
-	# shellcheck disable=SC1090
-	source "${AUTO_CONF}"
-fi
-
-if [[ ${AUTO_ENABLED} -ne 1 || -z ${AUTO_URL} ]]; then
-	rm -f "${TMP_FILE}"
-	exit 0
-fi
-
-if ! curl -fsSL "${AUTO_URL}" -o "${TMP_FILE}"; then
-	rm -f "${TMP_FILE}"
-	exit 0
-fi
-
-if [[ ! -f ${CONFIG_PATH} ]]; then
-	mv "${TMP_FILE}" "${CONFIG_PATH}"
-	touch "${UPDATED_FLAG}"
-	exit 0
-fi
-
-current_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
-new_hash=$(sha256sum "${TMP_FILE}" | awk '{print $1}')
-
-if [[ ${current_hash} != ${new_hash} ]]; then
-	mv "${TMP_FILE}" "${CONFIG_PATH}"
-	touch "${UPDATED_FLAG}"
-else
-	rm -f "${TMP_FILE}"
-fi
-US
-	chmod +x "${UPDATE_SCRIPT}"
-}
-
-main_loop() {
-	ensure_update_script
+do_config_update() {
 	read_auto_conf
-	local last_update=0
-	local last_hash=""
-	if [[ -f ${CONFIG_PATH} ]]; then
-		last_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
+	[[ ${AUTO_ENABLED} -eq 1 && -n ${AUTO_URL} ]] || return 0
+	local tmp; tmp=$(mktemp)
+	if ! curl -fsSL "${AUTO_URL}" -o "${tmp}" 2>/dev/null; then
+		rm -f "${tmp}"; return 0
 	fi
-	while true; do
-		read_auto_conf
-		local now
-		now=$(date +%s)
-		local interval=$((AUTO_INTERVAL * 60))
-		if (( interval <= 0 )); then
-			interval=600
-		fi
-		if [[ ${AUTO_ENABLED} -eq 1 ]]; then
-			if (( now - last_update >= interval )); then
-				"${UPDATE_SCRIPT}" || true
-				last_update=${now}
-			fi
-		fi
-		if [[ -f ${UPDATED_FLAG} ]]; then
-			rm -f "${UPDATED_FLAG}"
-			if [[ -f ${CONFIG_PATH} ]]; then
-				last_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
-			else
-				last_hash=""
-			fi
+	if [[ ! -f ${CONFIG_PATH} ]]; then
+		mv "${tmp}" "${CONFIG_PATH}"; return 0
+	fi
+	local cur_hash new_hash
+	cur_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
+	new_hash=$(sha256sum "${tmp}" | awk '{print $1}')
+	if [[ ${cur_hash} != "${new_hash}" ]]; then
+		mv "${tmp}" "${CONFIG_PATH}"
+	else
+		rm -f "${tmp}"
+	fi
+}
+
+last_update=0
+last_hash=""
+[[ -f ${CONFIG_PATH} ]] && last_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
+
+while true; do
+	read_auto_conf
+	now=$(date +%s)
+	interval=$(( AUTO_INTERVAL * 60 ))
+	(( interval > 0 )) || interval=600
+
+	# Periodic config sync
+	if [[ ${AUTO_ENABLED} -eq 1 ]] && (( now - last_update >= interval )); then
+		do_config_update || true
+		last_update=${now}
+	fi
+
+	# Detect config change → restart agent
+	if [[ -f ${CONFIG_PATH} ]]; then
+		cur_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
+		if [[ ${cur_hash} != "${last_hash}" ]]; then
+			last_hash=${cur_hash}
 			cleanup
 		fi
-		if [[ -f ${CONFIG_PATH} ]]; then
-			local current_hash
-			current_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
-			if [[ ${current_hash} != ${last_hash} ]]; then
-				last_hash=${current_hash}
-				cleanup
-			fi
-		fi
-		if [[ ${agent_pid:-0} -eq 0 ]]; then
-			if [[ -x ${BIN_PATH} && -f ${CONFIG_PATH} ]]; then
-				"${BIN_PATH}" --config "${CONFIG_PATH}" >>"${AGENT_LOG}" 2>&1 &
-				agent_pid=$!
-			else
-				sleep 5
-				continue
-			fi
-		elif ! kill -0 "${agent_pid}" 2>/dev/null; then
-			wait "${agent_pid}" 2>/dev/null || true
-			agent_pid=0
-		fi
-		sleep 5
-		done
-}
+	fi
 
-main_loop
-EOF
-	chmod +x "${RUN_DIR}/komari-wrapper.sh"
+	# Log rotation (>2MB → archive + truncate)
+	if [[ -f ${AGENT_LOG} ]]; then
+		log_bytes=$(wc -c < "${AGENT_LOG}" 2>/dev/null || echo 0)
+		if (( log_bytes > 2097152 )); then
+			cp "${AGENT_LOG}" "${AGENT_LOG}.1" 2>/dev/null || true
+			: > "${AGENT_LOG}"
+		fi
+	fi
+
+	# Start or maintain agent process
+	if (( agent_pid == 0 )); then
+		if [[ -x ${BIN_PATH} && -f ${CONFIG_PATH} ]]; then
+			"${BIN_PATH}" --config "${CONFIG_PATH}" >>"${AGENT_LOG}" 2>&1 &
+			agent_pid=$!
+		else
+			sleep 5; continue
+		fi
+	elif ! kill -0 "${agent_pid}" 2>/dev/null; then
+		wait "${agent_pid}" 2>/dev/null || true
+		agent_pid=0
+	fi
+
+	sleep 5
+done
+WRAPPER
+	chown root:"${SERVICE_GROUP}" "${RUN_DIR}/komari-wrapper.sh"
+	chmod 750 "${RUN_DIR}/komari-wrapper.sh"
 }
 
 write_auto_conf() {
-	local enabled=$1
-	local interval=$2
-	local url=$3
+	local enabled=$1 interval=$2 url=$3
 	{
 		printf 'AUTO_ENABLED=%s\n' "${enabled}"
 		printf 'AUTO_INTERVAL=%s\n' "${interval}"
 		printf 'AUTO_URL=%q\n' "${url}"
 	} >"${RUN_DIR}/auto-update.conf"
+	chown root:"${SERVICE_GROUP}" "${RUN_DIR}/auto-update.conf"
+	chmod 640 "${RUN_DIR}/auto-update.conf"
 }
 
-setup_systemd_service() {
-	mkdir -p "${HOME}/.config/systemd/user"
-	cat >"${SYSTEMD_UNIT_PATH}" <<EOF
+setup_systemd() {
+	cat >"${SYSTEMD_UNIT}" <<EOF
 [Unit]
-Description=Komari Agent (user scope)
+Description=Komari Agent (hardened)
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
 ExecStart=${RUN_DIR}/komari-wrapper.sh
 Restart=always
 RestartSec=5
-Environment=DEBUG=${DEBUG_MODE}
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ReadWritePaths=${INSTALL_DIR}
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+UMask=0077
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
-	if ! command -v systemctl >/dev/null 2>&1; then
-		log_warn "systemctl not available; start ${SERVICE_NAME} manually"
-		return
-	fi
-
-	systemctl --user daemon-reload
-	if systemctl --user enable --now "${SERVICE_NAME}"; then
-		log_success "systemd user service ${SERVICE_NAME} active"
+	systemctl daemon-reload
+	if systemctl enable --now "${SERVICE_NAME}"; then
+		log_ok "systemd service active (hardened sandbox)"
 	else
-		log_warn "Failed to enable systemd user service"
+		log_warn "Failed to enable systemd service"
 	fi
+}
+
+setup_openrc() {
+	cat >"${OPENRC_INIT}" <<'INITEOF'
+#!/sbin/openrc-run
+
+name="komari-agent"
+description="Komari Agent (hardened)"
+
+command="/opt/komari-agent/run/komari-wrapper.sh"
+command_user="komari:komari"
+command_background=true
+pidfile="/opt/komari-agent/run/${name}.pid"
+output_log="/opt/komari-agent/logs/komari-agent.log"
+error_log="/opt/komari-agent/logs/komari-agent.log"
+
+depend() {
+	need net
+	after firewall
+}
+INITEOF
+	chmod 755 "${OPENRC_INIT}"
+
+	rc-update add "${SERVICE_NAME}" default 2>/dev/null || true
+	rc-service "${SERVICE_NAME}" start 2>/dev/null || log_warn "Failed to start OpenRC service"
+	log_ok "OpenRC service installed"
 }
 
 setup_alpine_cron() {
 	local interval=10
 	if [[ -f ${RUN_DIR}/auto-update.conf ]]; then
-		local AUTO_ENABLED AUTO_INTERVAL AUTO_URL
-		# shellcheck disable=SC1090
+		local AUTO_ENABLED=0 AUTO_INTERVAL=10 AUTO_URL=""
 		source "${RUN_DIR}/auto-update.conf"
-		if [[ ${AUTO_INTERVAL:-} =~ ^[0-9]+$ && ${AUTO_INTERVAL} -gt 0 ]]; then
-			interval=${AUTO_INTERVAL}
-		fi
+		[[ ${AUTO_INTERVAL} =~ ^[0-9]+$ && ${AUTO_INTERVAL} -gt 0 ]] && interval=${AUTO_INTERVAL}
 	fi
-	if (( interval <= 0 )); then
-		interval=10
-	fi
-	if (( interval > 59 )); then
-		interval=59
-	fi
-	local schedule="*/${interval}"
+	(( interval > 59 )) && interval=59
 
-	local cron_file
-	cron_file=$(mktemp)
-	if crontab -l 2>/dev/null | grep -v "${RUN_DIR}/komari-cron-wrapper.sh" >"${cron_file}"; then
-		:
-	else
-		: >"${cron_file}"
-	fi
-	{
-		echo "@reboot ${RUN_DIR}/komari-cron-wrapper.sh"
-		echo "${schedule} * * * * ${RUN_DIR}/komari-cron-wrapper.sh --tick"
-	} >>"${cron_file}"
-	crontab "${cron_file}"
-	rm -f "${cron_file}"
-	cat >"${RUN_DIR}/komari-cron-wrapper.sh" <<'EOF'
+	cat >"${RUN_DIR}/cron-update.sh" <<'CRON'
 #!/usr/bin/env bash
 set -euo pipefail
+RUN_DIR="/opt/komari-agent/run"
+AUTO_CONF="${RUN_DIR}/auto-update.conf"
+CONFIG_PATH="/opt/komari-agent/config.json"
+AUTO_ENABLED=0; AUTO_INTERVAL=10; AUTO_URL=""
+[[ -f ${AUTO_CONF} ]] && source "${AUTO_CONF}"
+[[ ${AUTO_ENABLED} -eq 1 && -n ${AUTO_URL} ]] || exit 0
+TMP=$(mktemp)
+curl -fsSL "${AUTO_URL}" -o "${TMP}" 2>/dev/null || { rm -f "${TMP}"; exit 0; }
+if [[ ! -f ${CONFIG_PATH} ]]; then mv "${TMP}" "${CONFIG_PATH}"; exit 0; fi
+cur=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
+new=$(sha256sum "${TMP}" | awk '{print $1}')
+[[ ${cur} != "${new}" ]] && mv "${TMP}" "${CONFIG_PATH}" || rm -f "${TMP}"
+CRON
+	chown root:"${SERVICE_GROUP}" "${RUN_DIR}/cron-update.sh"
+	chmod 750 "${RUN_DIR}/cron-update.sh"
 
-RUN_DIR="${HOME}/.local/komari-agent/run"
-WRAPPER="${RUN_DIR}/komari-wrapper.sh"
-
-if [[ ${1-} == "--tick" ]]; then
-	"${RUN_DIR}/update-config.sh" || true
-	exit 0
-fi
-
-	if command -v pgrep >/dev/null 2>&1; then
-		if ! pgrep -f "${WRAPPER}" >/dev/null 2>&1; then
-			nohup "${WRAPPER}" >/dev/null 2>&1 &
-		fi
-	else
-		if ! ps -ef | grep -F "${WRAPPER}" | grep -v grep >/dev/null 2>&1; then
-			nohup "${WRAPPER}" >/dev/null 2>&1 &
-		fi
-	fi
-EOF
-	chmod +x "${RUN_DIR}/komari-cron-wrapper.sh"
-	touch "${ALPINE_CRON_MARKER}"
-	nohup "${RUN_DIR}/komari-cron-wrapper.sh" >/dev/null 2>&1 &
-	log_success "cron-based supervision installed (interval ${interval} min)"
+	local cron_file; cron_file=$(mktemp)
+	echo "*/${interval} * * * * ${RUN_DIR}/cron-update.sh" >"${cron_file}"
+	crontab -u "${SERVICE_USER}" "${cron_file}" 2>/dev/null || \
+		log_warn "Failed to install crontab for ${SERVICE_USER}"
+	rm -f "${cron_file}"
+	touch "${CRON_MARKER}"
+	log_ok "Cron config-sync installed (every ${interval} min)"
 }
 
-render_log_tail() {
-	if running_on_systemd && command -v systemctl >/dev/null 2>&1; then
-		systemctl --user status "${SERVICE_NAME}" --no-pager || true
-		journalctl --user-unit "${SERVICE_NAME}" -n 50 -f
-	else
-		if [[ -f ${LOG_DIR}/komari-agent.log ]]; then
-			tail -n 50 -f "${LOG_DIR}/komari-agent.log"
-		else
-			die "Log file not found"
+enable_crond_alpine() {
+	if is_alpine; then
+		rc-service crond start 2>/dev/null || true
+		rc-update add crond 2>/dev/null || true
+	fi
+}
+
+show_logs() {
+	if is_systemd && command -v systemctl >/dev/null 2>&1; then
+		systemctl status "${SERVICE_NAME}" --no-pager 2>/dev/null || true
+		journalctl -u "${SERVICE_NAME}" -n 50 -f
+	elif [[ -f ${LOG_DIR}/komari-agent.log ]]; then
+		if is_alpine && command -v rc-service >/dev/null 2>&1; then
+			rc-service "${SERVICE_NAME}" status 2>/dev/null || true
 		fi
+		tail -n 50 -f "${LOG_DIR}/komari-agent.log"
+	else
+		die "No log found at ${LOG_DIR}/komari-agent.log"
 	fi
 }
 
 uninstall_all() {
-	log_info "Stopping komari-agent services"
-	if running_on_systemd; then
-		systemctl --user stop "${SERVICE_NAME}" || true
-		systemctl --user disable "${SERVICE_NAME}" || true
-		rm -f "${SYSTEMD_UNIT_PATH}"
-		systemctl --user daemon-reload || true
+	require_root
+	log_info "Uninstalling komari-agent..."
+
+	# systemd
+	if is_systemd; then
+		systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+		systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
+		rm -f "${SYSTEMD_UNIT}"
+		systemctl daemon-reload 2>/dev/null || true
 	fi
-	if running_on_alpine && [[ -f ${ALPINE_CRON_MARKER} ]]; then
-		local cron_file
-		cron_file=$(mktemp)
-		if crontab -l 2>/dev/null | grep -v "${RUN_DIR}/komari-cron-wrapper.sh" >"${cron_file}"; then
-			crontab "${cron_file}" || true
-		else
-			crontab -r 2>/dev/null || true
-		fi
-		rm -f "${cron_file}" "${ALPINE_CRON_MARKER}"
+
+	# OpenRC
+	if is_alpine; then
+		rc-service "${SERVICE_NAME}" stop 2>/dev/null || true
+		rc-update del "${SERVICE_NAME}" 2>/dev/null || true
+		rm -f "${OPENRC_INIT}"
 	fi
+
+	# Crontab
+	[[ -f ${CRON_MARKER} ]] && crontab -u "${SERVICE_USER}" -r 2>/dev/null || true
+
+	# Kill remaining processes
+	if id "${SERVICE_USER}" &>/dev/null; then
+		pkill -u "${SERVICE_USER}" 2>/dev/null || true
+		sleep 1
+		pkill -9 -u "${SERVICE_USER}" 2>/dev/null || true
+	fi
+
 	rm -rf "${INSTALL_DIR}"
-	log_success "komari-agent uninstalled"
+	remove_service_user
+	log_ok "komari-agent fully uninstalled"
 }
 
-is_installed() {
-	[[ -x ${BIN_PATH} ]]
+is_installed() { [[ -x ${BIN_PATH} ]]; }
+
+parse_args() {
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			-c)  [[ $# -ge 2 ]] || die "-c requires a value"; CFG_SOURCE=$2; shift 2 ;;
+			-a)  [[ $# -ge 2 ]] || die "-a requires a value"; OPT_AUTO_DISCOVERY=$2; shift 2 ;;
+			-t)  [[ $# -ge 2 ]] || die "-t requires a value"; OPT_TOKEN=$2; shift 2 ;;
+			-e)  [[ $# -ge 2 ]] || die "-e requires a value"; OPT_ENDPOINT=$2; shift 2 ;;
+			-log) SHOW_LOGS=1; shift ;;
+			--auto)
+				if [[ $# -ge 2 && $2 != -* ]]; then
+					AUTO_MODE=$2; shift 2
+				else
+					AUTO_MODE=10; shift
+				fi ;;
+			--debug) DEBUG_MODE=1; shift ;;
+			-u|--uninstall) UNINSTALL_ONLY=1; shift ;;
+			-h|--help) usage; exit 0 ;;
+			*) log_warn "Unknown option: $1"; shift ;;
+		esac
+	done
 }
 
-# -----------------------------
-# Argument parsing
-# -----------------------------
+main() {
+	parse_args "$@"
 
-POSITIONAL=()
-while [[ $# -gt 0 ]]; do
-	case $1 in
-		-c)
-			[[ $# -ge 2 ]] || die "-c requires a value"
-			CFG_SOURCE=$2
-			shift 2
-			;;
-		-a)
-			[[ $# -ge 2 ]] || die "-a requires a value"
-			OPT_AUTO_DISCOVERY=$2
-			shift 2
-			;;
-		-t)
-			[[ $# -ge 2 ]] || die "-t requires a value"
-			OPT_TOKEN=$2
-			shift 2
-			;;
-		-e)
-			[[ $# -ge 2 ]] || die "-e requires a value"
-			OPT_ENDPOINT=$2
-			shift 2
-			;;
-		-log)
-			SHOW_LOGS=1
-			shift
-			;;
-		--auto)
-			if [[ $# -ge 2 && $2 != -* ]]; then
-				AUTO_MODE=$2
-				shift 2
-			else
-				AUTO_MODE=10
-				shift
-			fi
-			;;
-		--debug)
-			DEBUG_MODE=1
-			shift
-			;;
-		-u|--uninstall)
-			UNINSTALL_ONLY=1
-			shift
-			;;
-		-h|--help)
-			usage
-			exit 0
-			;;
-		*)
-			POSITIONAL+=("$1")
-			shift
-			;;
-	esac
-done
+	(( DEBUG_MODE )) && set -x
 
-set -- "${POSITIONAL[@]}"
+	if (( UNINSTALL_ONLY )); then uninstall_all; exit 0; fi
+	if (( SHOW_LOGS ));      then show_logs;     exit 0; fi
 
-if [[ ${DEBUG_MODE} -eq 1 ]]; then
-	set -x
-fi
-
-if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
-	log_warn "Ignoring unexpected positional arguments: ${POSITIONAL[*]}"
-fi
-
-if [[ ${UNINSTALL_ONLY} -eq 1 ]]; then
-	uninstall_all
-	exit 0
-fi
-
-if [[ ${SHOW_LOGS} -eq 1 ]]; then
-	render_log_tail
-	exit 0
-fi
-
-install_packages curl
-if ! command -v sha256sum >/dev/null 2>&1; then
-	die "sha256sum command not found. Please install coreutils or equivalent."
-fi
-if ! command -v jq >/dev/null 2>&1; then
-	install_packages jq
-fi
-if ! running_on_systemd; then
-	install_packages crontab
-fi
-enable_crond_on_alpine
-
-# Validate inputs
-VALID_COMBO=0
-
-if [[ -n ${CFG_SOURCE} ]]; then
-	VALID_COMBO=1
-	original_source=${CFG_SOURCE}
-	if [[ ${CFG_SOURCE} =~ ^https?:// ]]; then
-		validate_url "${CFG_SOURCE}" || die "-c URL is not reachable"
-		CFG_URL_FOR_AUTO="${CFG_SOURCE}"
-		CFG_SOURCE_TYPE="remote"
-	elif [[ -f ${CFG_SOURCE} ]]; then
-		CFG_URL_FOR_AUTO=""
-		CFG_SOURCE_TYPE="local"
-	else
-		if looks_like_domain_with_path "${CFG_SOURCE}"; then
-			https_candidate="https://${CFG_SOURCE}"
-			if validate_url "${https_candidate}"; then
-				CFG_SOURCE="${https_candidate}"
-				CFG_URL_FOR_AUTO="${CFG_SOURCE}"
-				CFG_SOURCE_TYPE="remote"
-			else
-				http_candidate="http://${CFG_SOURCE}"
-				if validate_url "${http_candidate}"; then
-					CFG_SOURCE="${http_candidate}"
-					CFG_URL_FOR_AUTO="${CFG_SOURCE}"
-					CFG_SOURCE_TYPE="remote"
-				else
-					die "-c value ${original_source} not found locally and unreachable via http(s)"
-				fi
-			fi
-		elif is_filesystem_path "${CFG_SOURCE}"; then
-			die "Config file ${CFG_SOURCE} not found"
-		elif is_plain_filename "${CFG_SOURCE}"; then
-			https_candidate="https://${CFG_SOURCE}"
-			if validate_url "${https_candidate}"; then
-				CFG_SOURCE="${https_candidate}"
-				CFG_URL_FOR_AUTO="${CFG_SOURCE}"
-				CFG_SOURCE_TYPE="remote"
-			else
-				http_candidate="http://${CFG_SOURCE}"
-				if validate_url "${http_candidate}"; then
-					CFG_SOURCE="${http_candidate}"
-					CFG_URL_FOR_AUTO="${CFG_SOURCE}"
-					CFG_SOURCE_TYPE="remote"
-				else
-					die "-c value ${original_source} not found locally and unreachable via http(s)"
-				fi
-			fi
-		else
-			die "Config file ${CFG_SOURCE} not found"
-		fi
+	require_root
+	install_packages curl
+	command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found (install coreutils)"
+	command -v jq >/dev/null 2>&1 || install_packages jq
+	if is_alpine && ! is_systemd; then
+		install_packages bash crontab
+		enable_crond_alpine
 	fi
-fi
 
-if [[ -n ${OPT_ENDPOINT} ]]; then
-	OPT_ENDPOINT=$(normalize_endpoint "${OPT_ENDPOINT}")
-fi
+	local valid=0
 
-if [[ -n ${OPT_AUTO_DISCOVERY} || -n ${OPT_TOKEN} ]]; then
-	[[ -n ${OPT_ENDPOINT} ]] || die "-e must be supplied when using -a or -t"
-	validate_url "${OPT_ENDPOINT}" || die "Invalid endpoint URL"
-fi
+	if [[ -n ${CFG_SOURCE} ]]; then
+		resolve_cfg_source "${CFG_SOURCE}"
+		valid=1
+	fi
 
-if [[ -n ${OPT_AUTO_DISCOVERY} ]]; then
-	validate_alnum "${OPT_AUTO_DISCOVERY}" || die "-a value must be alphanumeric <=64 chars"
-	VALID_COMBO=1
-fi
+	[[ -n ${OPT_ENDPOINT} ]] && OPT_ENDPOINT=$(normalize_endpoint "${OPT_ENDPOINT}")
 
-if [[ -n ${OPT_TOKEN} ]]; then
-	validate_alnum "${OPT_TOKEN}" || die "-t value must be alphanumeric <=64 chars"
-	VALID_COMBO=1
-fi
+	if [[ -n ${OPT_AUTO_DISCOVERY} || -n ${OPT_TOKEN} ]]; then
+		[[ -n ${OPT_ENDPOINT} ]] || die "-e is required with -a or -t"
+		validate_url "${OPT_ENDPOINT}" || die "Endpoint unreachable: ${OPT_ENDPOINT}"
+	fi
+	if [[ -n ${OPT_AUTO_DISCOVERY} ]]; then
+		validate_alnum "${OPT_AUTO_DISCOVERY}" || die "-a must be alphanumeric <=64 chars"
+		valid=1
+	fi
+	if [[ -n ${OPT_TOKEN} ]]; then
+		validate_alnum "${OPT_TOKEN}" || die "-t must be alphanumeric <=64 chars"
+		valid=1
+	fi
 
-if [[ -n ${OPT_ENDPOINT} ]]; then
-	VALID_COMBO=1
-fi
+	(( valid )) || die "Requires: -c, or (-a -e), or (-t -e). Use -h for help."
 
-if [[ ${VALID_COMBO} -eq 0 ]]; then
-	die "Installation requires -c or (-a & -e) or (-t & -e)."
-fi
+	if is_installed; then
+		log_warn "Already installed at ${INSTALL_DIR}"
+		log_info "Use -u to uninstall, -log to view logs"
+		exit 0
+	fi
 
-ensure_dirs
+	create_service_user
+	ensure_dirs
 
-if is_installed; then
-	log_warn "komari-agent already installed at ${INSTALL_DIR}. Use -u to uninstall or -log to inspect logs."
-	exit 0
-fi
+	fetch_config "${CFG_SOURCE}" "${CONFIG_PATH}"
+	[[ ${CFG_SOURCE_TYPE} == "local" ]] && validate_json_file "${CONFIG_PATH}"
 
-fetch_config_from_source "${CFG_SOURCE}" "${CONFIG_PATH}"
+	[[ -n ${OPT_AUTO_DISCOVERY} ]] && json_set "${CONFIG_PATH}" "auto_discovery_key" "${OPT_AUTO_DISCOVERY}"
+	[[ -n ${OPT_TOKEN} ]]          && json_set "${CONFIG_PATH}" "token" "${OPT_TOKEN}"
+	[[ -n ${OPT_ENDPOINT} ]]       && json_set "${CONFIG_PATH}" "endpoint" "${OPT_ENDPOINT}"
 
-if [[ ${CFG_SOURCE_TYPE} == "local" ]]; then
 	validate_json_file "${CONFIG_PATH}"
-fi
+	chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_PATH}"
+	chmod 600 "${CONFIG_PATH}"
 
-if [[ -n ${OPT_AUTO_DISCOVERY} ]]; then
-	apply_config_override "auto_discovery_key" "${OPT_AUTO_DISCOVERY}" "${CONFIG_PATH}"
-fi
-if [[ -n ${OPT_TOKEN} ]]; then
-	apply_config_override "token" "${OPT_TOKEN}" "${CONFIG_PATH}"
-fi
-if [[ -n ${OPT_ENDPOINT} ]]; then
-	apply_config_override "endpoint" "${OPT_ENDPOINT}" "${CONFIG_PATH}"
-fi
+	[[ ${CFG_SOURCE_TYPE} == "local" ]] && validate_config_credentials "${CONFIG_PATH}"
 
-validate_json_file "${CONFIG_PATH}"
-chmod 600 "${CONFIG_PATH}"
+	download_binary
+	generate_wrapper
 
-if [[ ${CFG_SOURCE_TYPE} == "local" ]]; then
-	validate_local_config_requirements "${CONFIG_PATH}"
-fi
+	local auto_enabled=0 auto_interval=10 auto_url="${CFG_URL_FOR_AUTO}"
 
-download_agent_binary
-generate_wrapper_script
-
-AUTO_ENABLED=0
-AUTO_INTERVAL=10
-AUTO_URL="${CFG_URL_FOR_AUTO}"
-
-if [[ -n ${AUTO_MODE} ]]; then
-	AUTO_MODE=$(printf '%s' "${AUTO_MODE}" | tr '[:upper:]' '[:lower:]')
-	if [[ ${AUTO_MODE} == d ]]; then
-		AUTO_ENABLED=0
-	else
-		if [[ ${AUTO_MODE} =~ ^[0-9]+$ ]]; then
-			if (( AUTO_MODE == 0 )); then
-				die "--auto value must be greater than 0"
-			fi
-			AUTO_ENABLED=1
-			AUTO_INTERVAL=${AUTO_MODE}
-			if [[ -z ${AUTO_URL} ]]; then
-				die "--auto requires a remote URL source provided via -c"
-			fi
+	if [[ -n ${AUTO_MODE} ]]; then
+		local mode=${AUTO_MODE,,}
+		if [[ ${mode} == "d" ]]; then
+			auto_enabled=0
+		elif [[ ${mode} =~ ^[0-9]+$ ]]; then
+			(( mode > 0 )) || die "--auto value must be > 0"
+			auto_enabled=1
+			auto_interval=${mode}
+			[[ -n ${auto_url} ]] || die "--auto requires a remote URL via -c"
 		else
-			die "Invalid value for --auto"
+			die "Invalid --auto value: ${AUTO_MODE}"
 		fi
 	fi
-fi
 
-write_auto_conf "${AUTO_ENABLED}" "${AUTO_INTERVAL}" "${AUTO_URL}"
+	write_auto_conf "${auto_enabled}" "${auto_interval}" "${auto_url}"
 
-ensure_linger
+	if is_systemd; then
+		setup_systemd
+	elif is_alpine; then
+		setup_openrc
+		(( auto_enabled )) && setup_alpine_cron
+	else
+		die "No supported init system (need systemd or OpenRC)"
+	fi
 
-if running_on_systemd; then
-	setup_systemd_service
-else
-	setup_alpine_cron
-fi
+	echo ""
+	log_ok "komari-agent installed"
+	log_info "  User:    ${SERVICE_USER} (nologin, no home)"
+	log_info "  Dir:     ${INSTALL_DIR}"
+	log_info "  Config:  ${CONFIG_PATH} (mode 600)"
+	log_info "  Binary:  ${BIN_PATH} (mode 750)"
+	if (( auto_enabled )); then
+		log_info "  Sync:    every ${auto_interval} min from ${auto_url}"
+	else
+		log_info "  Sync:    disabled"
+	fi
+	log_info "  Logs:    sudo bash ${SCRIPT_NAME} -log"
+	log_info "  Remove:  sudo bash ${SCRIPT_NAME} -u"
+}
 
-if [[ ${AUTO_ENABLED} -eq 1 ]]; then
-	log_info "Auto config updates enabled every ${AUTO_INTERVAL} minute(s) from ${AUTO_URL}"
-else
-	log_info "Auto config updates disabled"
-fi
-
-log_success "komari-agent installation complete"
-
+main "$@"
