@@ -349,6 +349,9 @@ ensure_dirs() {
 	chmod 750 "${INSTALL_DIR}" "${INSTALL_DIR}/bin" "${LOG_DIR}" "${RUN_DIR}"
 	# bin/ and run/: root-owned, service user read+exec only (defense-in-depth)
 	chown root:"${SERVICE_GROUP}" "${INSTALL_DIR}/bin" "${RUN_DIR}"
+	# Agent writes auto-discovery.json next to binary (hardcoded in Go source).
+	# Symlink redirects writes from root-owned bin/ to komari-writable base dir.
+	ln -sf "${INSTALL_DIR}/auto-discovery.json" "${INSTALL_DIR}/bin/auto-discovery.json"
 }
 
 current_arch_url() {
@@ -427,9 +430,39 @@ do_config_update() {
 	fi
 }
 
+# After successful auto-discovery registration, the agent writes
+# auto-discovery.json with {uuid, token}. Promote that token into
+# config.json and clear auto_discovery_key so the agent never re-registers.
+promote_auto_discovery() {
+	local ad_json="${INSTALL_DIR}/auto-discovery.json"
+	[[ -f ${ad_json} ]] || return 0
+	command -v jq >/dev/null 2>&1 || return 0
+	[[ -f ${CONFIG_PATH} ]] || return 0
+
+	local ad_token current_key
+	ad_token=$(jq -r '.token // ""' "${ad_json}" 2>/dev/null)
+	[[ -n ${ad_token} ]] || return 0
+
+	current_key=$(jq -r '.auto_discovery_key // ""' "${CONFIG_PATH}" 2>/dev/null)
+	[[ -n ${current_key} ]] || return 0  # already promoted or using -t
+
+	local tmp; tmp=$(mktemp)
+	if jq --arg t "${ad_token}" '.token = $t | .auto_discovery_key = ""' \
+		"${CONFIG_PATH}" >"${tmp}" 2>/dev/null; then
+		mv "${tmp}" "${CONFIG_PATH}"
+		rm -f "${ad_json}"
+	else
+		rm -f "${tmp}"
+	fi
+}
+
 last_update=0
 last_hash=""
 [[ -f ${CONFIG_PATH} ]] && last_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
+
+# Crash-loop backoff: if agent exits too fast, delay restarts exponentially
+crash_count=0
+last_start=0
 
 while true; do
 	read_auto_conf
@@ -443,12 +476,16 @@ while true; do
 		last_update=${now}
 	fi
 
+	# Promote auto-discovery token → config.json (one-time migration)
+	promote_auto_discovery || true
+
 	# Detect config change → restart agent
 	if [[ -f ${CONFIG_PATH} ]]; then
 		cur_hash=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
 		if [[ ${cur_hash} != "${last_hash}" ]]; then
 			last_hash=${cur_hash}
 			cleanup
+			crash_count=0
 		fi
 	fi
 
@@ -463,7 +500,17 @@ while true; do
 
 	# Start or maintain agent process
 	if (( agent_pid == 0 )); then
+		# Crash-loop backoff: 5s, 10s, 20s, 40s, ... up to 300s (5 min)
+		if (( crash_count > 0 )); then
+			backoff=$(( 5 * (1 << (crash_count > 6 ? 6 : crash_count)) ))
+			(( backoff > 300 )) && backoff=300
+			elapsed=$(( $(date +%s) - last_start ))
+			if (( elapsed < backoff )); then
+				sleep 5; continue
+			fi
+		fi
 		if [[ -x ${BIN_PATH} && -f ${CONFIG_PATH} ]]; then
+			last_start=$(date +%s)
 			"${BIN_PATH}" --config "${CONFIG_PATH}" >>"${AGENT_LOG}" 2>&1 &
 			agent_pid=$!
 		else
@@ -472,6 +519,12 @@ while true; do
 	elif ! kill -0 "${agent_pid}" 2>/dev/null; then
 		wait "${agent_pid}" 2>/dev/null || true
 		agent_pid=0
+		runtime=$(( $(date +%s) - last_start ))
+		if (( runtime < 10 )); then
+			(( crash_count++ ))
+		else
+			crash_count=0
+		fi
 	fi
 
 	sleep 5

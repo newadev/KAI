@@ -1,17 +1,19 @@
-# Komari Agent Install
-
-- **主要功能**：自动准备依赖、下载最新二进制、写入配置、启用 systemd 用户服务或 cron 监管，并支持远程配置的自动定时同步。
-- **适用环境**：Linux 用户态安装，支持 systemd、OpenRC/cron，CPU 架构覆盖 `x86_64` 与 `aarch64`。
+# Komari Agent Installer
+- **主要功能**：自动准备依赖、自动守护更新、写入配置、启用 systemd 或 cron 监管，并支持远程配置的自动定时同步。
+- **适用环境**：支持 systemd、OpenRC/cron，CPU 架构覆盖 `x86_64` 与 `arm64`。
+- **支持系统**：Ubuntu/Debian/CentOS/AlmaLinux/Rocky/Fedora/Alpine
 
 ## 使用方法
 
-* 确保当前用户具备 `sudo` 权限（安装缺失依赖时会提示输入密码）。
+* 确保当前用户具备 `root` 权限
 * 使用配置文件：
    - `bash <(curl -sL komari.app) -c config.json`
    - `bash <(curl -sL komari.app) -c <URL>`
 * 使用自动发现或者指定TOKEN：
    - `bash <(curl -sL komari.app) -e <URL> -a <KEY>`
    - `bash <(curl -sL komari.app) -e <URL> -t <TOKEN>`
+* 使用远程配置文件 + 自动同步（每 10 分钟）：
+   - `bash <(curl -sL komari.app) -e <URL> --auto 10`
 
 ## 参数说明
 
@@ -26,10 +28,62 @@
 | `-log` | 服务状态和最近日志|
 | `-u` | 卸载脚本生成的所有内容 |
 
-## 常见操作
-- **更新配置后重启**：脚本会在配置变更后自动重启，无需手动操作。
-- **查看服务状态**：`systemctl --user status komari-agent`
-- **查看日志**：`bash kai.sh -log`
-- **卸载**：`bash kai.sh -u`
+### 安装目录结构
 
-> 提示：在非 systemd 环境（如 Alpine）下，脚本会自动写入定时任务并启动 `crond`，请确保系统允许用户级 cron 运行。
+```
+/opt/komari-agent/
+├── bin/komari-agent          # 二进制 (root:komari 750)
+├── config.json               # 配置文件 (komari:komari 600)
+├── logs/komari-agent.log     # 运行日志
+└── run/
+    ├── komari-wrapper.sh     # 进程管理包装脚本
+    └── auto-update.conf      # 自动同步配置
+```
+### 常用操作
+
+```bash
+# 服务状态（systemd 系统）
+sudo systemctl status komari-agent
+
+# 服务状态（Alpine）
+sudo rc-service komari-agent status
+
+# 查看实时日志
+sudo bash kai.sh -log
+
+# 卸载所有内容
+sudo bash kai.sh -u
+```
+
+## 默认配置文件说明
+
+| 字段名称 (Go Field) | 配置文件 Key (`json`) | 环境变量 (`env`) | 类型 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `Endpoint` | `endpoint` | `AGENT_ENDPOINT` | `string` | **必填**。面板连接地址 (格式 `host:port`，如 `dashboard.example.com:5555`) |
+| `Token` | `token` | `AGENT_TOKEN` | `string` | **必填**。Agent 通信密钥 |
+| `AutoDiscoveryKey` | `auto_discovery_key` | `AGENT_AUTO_DISCOVERY_KEY` | `string` | 自动发现密钥（用于未在面板手动添加服务器时自动注册） |
+| `IgnoreUnsafeCert` | `ignore_unsafe_cert` | `AGENT_IGNORE_UNSAFE_CERT` | `bool` | 是否忽略 SSL/TLS 证书验证（用于自签名证书） |
+| `MaxRetries` | `max_retries` | `AGENT_MAX_RETRIES` | `int` | 连接断开后的最大重试次数 |
+| `ReconnectInterval` | `reconnect_interval` | `AGENT_RECONNECT_INTERVAL` | `int` | 重连等待间隔（秒） |
+| `Interval` | `interval` | `AGENT_INTERVAL` | `float64` | 性能数据（CPU/内存等）采集上报间隔（秒） |
+| `InfoReportInterval` | `info_report_interval` | `AGENT_INFO_REPORT_INTERVAL` | `int` | 基础主机信息（系统版本/IP）上报间隔（分钟） |
+| `EnableGPU` | `enable_gpu` | `AGENT_ENABLE_GPU` | `bool` | 启用 GPU 状态监控（支持 NVIDIA 等显卡） |
+| `HostProc` | `host_proc` | `AGENT_HOST_PROC` | `string` | 宿主机 `/proc` 挂载路径（Docker 模式下设置为 `/host/proc` 以获取宿主机真实负载） |
+| `MemoryIncludeCache` | `memory_include_cache` | `AGENT_MEMORY_INCLUDE_CACHE` | `bool` | 统计内存占用时是否包含 Cache/Buffer |
+| `MemoryReportRawUsed`| `memory_report_raw_used` | `AGENT_MEMORY_REPORT_RAW_USED` | `bool` | 使用原始公式计算内存 (`Total - Free - Buffers - Cached`) |
+| `DisableWebSsh` | `disable_web_ssh` | `AGENT_DISABLE_WEB_SSH` | `bool` | **重要**。禁用 Web SSH 终端和远程命令执行功能 |
+| `DisableAutoUpdate` | `disable_auto_update` | `AGENT_DISABLE_AUTO_UPDATE` | `bool` | 禁用 Agent 自动更新功能 |
+| `CFAccessClientID` | `cf_access_client_id` | `AGENT_CF_ACCESS_CLIENT_ID` | `string` | Cloudflare Access ID（用于穿透 Cloudflare Zero Trust 防护） |
+| `CFAccessClientSecret`| `cf_access_client_secret`| `AGENT_CF_ACCESS_CLIENT_SECRET`| `string` | Cloudflare Access Secret |
+| `IncludeNics` | `include_nics` | `AGENT_INCLUDE_NICS` | `string` | 网卡**白名单**。仅统计此列表中的网卡（逗号分隔，支持通配符 `*`） |
+| `ExcludeNics` | `exclude_nics` | `AGENT_EXCLUDE_NICS` | `string` | 网卡**黑名单**。统计时排除此列表中的网卡（逗号分隔，支持通配符 `*`） |
+| `MonthRotate` | `month_rotate` | `AGENT_MONTH_ROTATE` | `int` | 流量统计的月度重置日期（1-31），设置为 `0` 表示禁用自动重置 |
+| `CustomDNS` | `custom_dns` | `AGENT_CUSTOM_DNS` | `string` | 强制指定 DNS 服务器（格式 `IP:Port`，如 `1.1.1.1:53`） |
+| `CustomIPv4` | `custom_ipv4` | `AGENT_CUSTOM_IPV4` | `string` | 自定义上报的 IPv4 地址（覆盖自动探测结果） |
+| `CustomIPv6` | `custom_ipv6` | `AGENT_CUSTOM_IPV6` | `string` | 自定义上报的 IPv6 地址 |
+| `GetIPAddrFromNIC` | `get_ip_addr_from_nic` | `AGENT_GET_IP_ADDR_FROM_NIC` | `bool` | 是否直接从网卡接口获取 IP，而不是通过外部 API 探测 |
+| `IncludeMountpoints` | `include_mountpoints` | `AGENT_INCLUDE_MOUNTPOINTS` | `string` | 磁盘统计的包含挂载点列表，使用分号分隔 |
+
+## 来源
+
+https://github.com/komari-monitor/komari-agent/
