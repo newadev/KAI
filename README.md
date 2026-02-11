@@ -57,32 +57,32 @@ sudo bash kai.sh -u
 
 ## 默认配置文件说明
 
-| 字段名称 (Go Field) | 配置文件 Key (`json`) | 环境变量 (`env`) | 类型 | 说明 |
-| :--- | :--- | :--- | :--- | :--- |
-| `Endpoint` | `endpoint` | `AGENT_ENDPOINT` | `string` | **必填**。面板连接地址 (格式 `host:port`，如 `dashboard.example.com:5555`) |
-| `Token` | `token` | `AGENT_TOKEN` | `string` | **必填**。Agent 通信密钥 |
-| `AutoDiscoveryKey` | `auto_discovery_key` | `AGENT_AUTO_DISCOVERY_KEY` | `string` | 自动发现密钥（用于未在面板手动添加服务器时自动注册） |
-| `IgnoreUnsafeCert` | `ignore_unsafe_cert` | `AGENT_IGNORE_UNSAFE_CERT` | `bool` | 是否忽略 SSL/TLS 证书验证（用于自签名证书） |
-| `MaxRetries` | `max_retries` | `AGENT_MAX_RETRIES` | `int` | 连接断开后的最大重试次数 |
-| `ReconnectInterval` | `reconnect_interval` | `AGENT_RECONNECT_INTERVAL` | `int` | 重连等待间隔（秒） |
-| `Interval` | `interval` | `AGENT_INTERVAL` | `float64` | 性能数据（CPU/内存等）采集上报间隔（秒） |
-| `InfoReportInterval` | `info_report_interval` | `AGENT_INFO_REPORT_INTERVAL` | `int` | 基础主机信息（系统版本/IP）上报间隔（分钟） |
-| `EnableGPU` | `enable_gpu` | `AGENT_ENABLE_GPU` | `bool` | 启用 GPU 状态监控（支持 NVIDIA 等显卡） |
-| `HostProc` | `host_proc` | `AGENT_HOST_PROC` | `string` | 宿主机 `/proc` 挂载路径（Docker 模式下设置为 `/host/proc` 以获取宿主机真实负载） |
-| `MemoryIncludeCache` | `memory_include_cache` | `AGENT_MEMORY_INCLUDE_CACHE` | `bool` | 统计内存占用时是否包含 Cache/Buffer |
-| `MemoryReportRawUsed`| `memory_report_raw_used` | `AGENT_MEMORY_REPORT_RAW_USED` | `bool` | 使用原始公式计算内存 (`Total - Free - Buffers - Cached`) |
-| `DisableWebSsh` | `disable_web_ssh` | `AGENT_DISABLE_WEB_SSH` | `bool` | **重要**。禁用 Web SSH 终端和远程命令执行功能 |
-| `DisableAutoUpdate` | `disable_auto_update` | `AGENT_DISABLE_AUTO_UPDATE` | `bool` | 禁用 Agent 自动更新功能 |
-| `CFAccessClientID` | `cf_access_client_id` | `AGENT_CF_ACCESS_CLIENT_ID` | `string` | Cloudflare Access ID（用于穿透 Cloudflare Zero Trust 防护） |
-| `CFAccessClientSecret`| `cf_access_client_secret`| `AGENT_CF_ACCESS_CLIENT_SECRET`| `string` | Cloudflare Access Secret |
-| `IncludeNics` | `include_nics` | `AGENT_INCLUDE_NICS` | `string` | 网卡**白名单**。仅统计此列表中的网卡（逗号分隔，支持通配符 `*`） |
-| `ExcludeNics` | `exclude_nics` | `AGENT_EXCLUDE_NICS` | `string` | 网卡**黑名单**。统计时排除此列表中的网卡（逗号分隔，支持通配符 `*`） |
-| `MonthRotate` | `month_rotate` | `AGENT_MONTH_ROTATE` | `int` | 流量统计的月度重置日期（1-31），设置为 `0` 表示禁用自动重置 |
-| `CustomDNS` | `custom_dns` | `AGENT_CUSTOM_DNS` | `string` | 强制指定 DNS 服务器（格式 `IP:Port`，如 `1.1.1.1:53`） |
-| `CustomIPv4` | `custom_ipv4` | `AGENT_CUSTOM_IPV4` | `string` | 自定义上报的 IPv4 地址（覆盖自动探测结果） |
-| `CustomIPv6` | `custom_ipv6` | `AGENT_CUSTOM_IPV6` | `string` | 自定义上报的 IPv6 地址 |
-| `GetIPAddrFromNIC` | `get_ip_addr_from_nic` | `AGENT_GET_IP_ADDR_FROM_NIC` | `bool` | 是否直接从网卡接口获取 IP，而不是通过外部 API 探测 |
-| `IncludeMountpoints` | `include_mountpoints` | `AGENT_INCLUDE_MOUNTPOINTS` | `string` | 磁盘统计的包含挂载点列表，使用分号分隔 |
+| 配置文件 Key (`json`) | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `endpoint` | `string` | **必填**。面板连接地址 (格式 `host:port`，如 `dashboard.example.com:5555`) |
+| `token` | `string` | **必填**。Agent 通信密钥 |
+| `auto_discovery_key` | `string` | 自动发现密钥（用于未在面板手动添加服务器时自动注册） |
+| `ignore_unsafe_cert` | `bool` | 是否忽略 SSL/TLS 证书验证（用于自签名证书） |
+| `max_retries` | `int` | 连接断开后的最大重试次数 |
+| `reconnect_interval` | `int` | 重连等待间隔（秒） |
+| `interval` | `float64` | 性能数据（CPU/内存等）采集上报间隔（秒） |
+| `info_report_interval` | `int` | 基础主机信息（系统版本/IP）上报间隔（分钟） |
+| `enable_gpu` | `bool` | 启用 GPU 状态监控（支持 NVIDIA 等显卡） |
+| `host_proc` | `string` | 宿主机 `/proc` 挂载路径（Docker 模式下设置为 `/host/proc` 以获取宿主机真实负载） |
+| `memory_include_cache` | `bool` | 统计内存占用时是否包含 Cache/Buffer |
+| `memory_report_raw_used` | `bool` | 使用原始公式计算内存 (`Total - Free - Buffers - Cached`) |
+| `disable_web_ssh` | `bool` | **重要**。禁用 Web SSH 终端和远程命令执行功能 |
+| `disable_auto_update` | `bool` | 禁用 Agent 自动更新功能 |
+| `cf_access_client_id` | `string` | Cloudflare Access ID（用于穿透 Cloudflare Zero Trust 防护） |
+| `cf_access_client_secret` | `string` | Cloudflare Access Secret |
+| `include_nics` | `string` | 网卡**白名单**。仅统计此列表中的网卡（逗号分隔，支持通配符 `*`） |
+| `exclude_nics` | `string` | 网卡**黑名单**。统计时排除此列表中的网卡（逗号分隔，支持通配符 `*`） |
+| `month_rotate` | `int` | 流量统计的月度重置日期（1-31），设置为 `0` 表示禁用自动重置 |
+| `custom_dns` | `string` | 强制指定 DNS 服务器（格式 `IP:Port`，如 `1.1.1.1:53`） |
+| `custom_ipv4` | `string` | 自定义上报的 IPv4 地址（覆盖自动探测结果） |
+| `custom_ipv6` | `string` | 自定义上报的 IPv6 地址 |
+| `get_ip_addr_from_nic` | `bool` | 是否直接从网卡接口获取 IP，而不是通过外部 API 探测 |
+| `include_mountpoints` | `string` | 磁盘统计的包含挂载点列表，使用分号分隔 |
 
 ## 来源
 
